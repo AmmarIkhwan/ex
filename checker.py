@@ -14,8 +14,23 @@ Usage:
     python visualize_masks.py --folder "test_images"
 
 Controls (when image window is open):
-    Q — quit / next image
-    S — save current visualization to  viz_results/
+    Q / ESC     — quit / next image
+    S           — save current visualization to viz_results/
+    R           — reset zoom and pan to fit screen
+
+    ZOOM:
+      Scroll wheel UP    — zoom in  (centered on mouse position)
+      Scroll wheel DOWN  — zoom out
+      +  /  =            — zoom in
+      -                  — zoom out
+
+    PAN  (while zoomed in):
+      Left-click + drag  — pan the view
+      Arrow keys         — pan left / right / up / down
+
+    COORDINATES:
+      Mouse hover        — shows pixel coordinate in the original image space
+                           printed in terminal (useful for finding mask coords!)
 """
 
 import cv2
@@ -175,6 +190,204 @@ def make_three_panel(original, masked_ai, annotated, product_key, config,
     return combined
 
 
+class ZoomPanViewer:
+    """
+    Interactive zoom & pan viewer for the three-panel image.
+
+    Zoom  : scroll wheel  or  +/-  keys
+    Pan   : left-click drag  or  arrow keys
+    Reset : R key
+    Coords: hover mouse → prints original-image pixel coordinates to terminal
+    """
+
+    ZOOM_STEP   = 1.15    # multiply zoom by this on each scroll tick
+    ZOOM_MIN    = 0.05
+    ZOOM_MAX    = 40.0
+    PAN_STEP    = 40      # pixels to pan per arrow-key press
+
+    def __init__(self, panel, win_name, orig_image_w):
+        self.panel       = panel          # full three-panel image (numpy array)
+        self.win         = win_name
+        self.ph, self.pw = panel.shape[:2]
+
+        # orig_image_w: width of ONE panel before the 3-panel composite was built.
+        # Used to map mouse X → which panel and the pixel coord within it.
+        self.orig_image_w = orig_image_w
+
+        # Fit-to-window scale at start
+        self._win_w = min(1800, self.pw)
+        self._win_h = int(self.ph * self._win_w / self.pw)
+        self.zoom   = self._win_w / self.pw   # initial scale = fit screen
+
+        # Pan offset: top-left corner of the visible region in panel-pixel space
+        self.pan_x  = 0.0
+        self.pan_y  = 0.0
+
+        # Mouse state for drag-pan
+        self._drag       = False
+        self._drag_start = (0, 0)
+        self._pan_start  = (0.0, 0.0)
+
+        # Last known mouse position (window pixels)
+        self._mouse_x = 0
+        self._mouse_y = 0
+
+    # ── coordinate helpers ────────────────────────────────────────────────────
+
+    def _win_to_panel(self, wx, wy):
+        """Convert window pixel → panel pixel (full composite)."""
+        px = wx / self.zoom + self.pan_x
+        py = wy / self.zoom + self.pan_y
+        return px, py
+
+    def _panel_to_orig(self, px, py, panel_w_per_col):
+        """
+        Convert panel pixel → (panel_index 0/1/2, x_in_orig, y_in_orig).
+        panel_w_per_col includes the title bar height offset already in Y.
+        """
+        title_bar_h = 44
+        col = int(px // panel_w_per_col)
+        col = max(0, min(2, col))
+        x_in = int(px - col * panel_w_per_col)
+        y_in = int(py - title_bar_h)
+        return col, x_in, y_in
+
+    # ── render ────────────────────────────────────────────────────────────────
+
+    def _get_view(self):
+        """Crop + resize the panel to produce the current window view."""
+        # Visible region in panel pixels
+        vis_w = self._win_w / self.zoom
+        vis_h = self._win_h / self.zoom
+
+        # Clamp pan so we never go out of bounds
+        self.pan_x = max(0.0, min(self.pan_x, self.pw - vis_w))
+        self.pan_y = max(0.0, min(self.pan_y, self.ph - vis_h))
+
+        x1 = int(self.pan_x)
+        y1 = int(self.pan_y)
+        x2 = min(self.pw, int(self.pan_x + vis_w) + 1)
+        y2 = min(self.ph, int(self.pan_y + vis_h) + 1)
+
+        crop = self.panel[y1:y2, x1:x2]
+        view = cv2.resize(crop, (self._win_w, self._win_h),
+                          interpolation=cv2.INTER_LINEAR)
+        return view
+
+    def _draw_hud(self, view):
+        """Overlay zoom level and coordinate hint on the view."""
+        txt = f"Zoom: {self.zoom:.2f}x  |  Scroll=zoom  Drag=pan  R=reset  S=save  Q=quit"
+        cv2.putText(view, txt, (8, self._win_h - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (200, 200, 200), 1, cv2.LINE_AA)
+
+    def _refresh(self):
+        view = self._get_view()
+        self._draw_hud(view)
+        cv2.imshow(self.win, view)
+
+    # ── zoom helper ───────────────────────────────────────────────────────────
+
+    def _zoom_at(self, factor, anchor_wx, anchor_wy):
+        """Zoom by `factor`, keeping panel point under (anchor_wx, anchor_wy) fixed."""
+        px_before, py_before = self._win_to_panel(anchor_wx, anchor_wy)
+        new_zoom = max(self.ZOOM_MIN, min(self.ZOOM_MAX, self.zoom * factor))
+        self.zoom  = new_zoom
+        # Recompute pan so the same panel pixel stays under the mouse
+        self.pan_x = px_before - anchor_wx / self.zoom
+        self.pan_y = py_before - anchor_wy / self.zoom
+        self._refresh()
+
+    def _reset(self):
+        self.zoom  = self._win_w / self.pw
+        self.pan_x = 0.0
+        self.pan_y = 0.0
+        self._refresh()
+
+    # ── callbacks ─────────────────────────────────────────────────────────────
+
+    def mouse_callback(self, event, x, y, flags, param):
+        self._mouse_x, self._mouse_y = x, y
+
+        if event == cv2.EVENT_MOUSEWHEEL:
+            factor = self.ZOOM_STEP if flags > 0 else 1.0 / self.ZOOM_STEP
+            self._zoom_at(factor, x, y)
+
+        elif event == cv2.EVENT_LBUTTONDOWN:
+            self._drag       = True
+            self._drag_start = (x, y)
+            self._pan_start  = (self.pan_x, self.pan_y)
+
+        elif event == cv2.EVENT_MOUSEMOVE:
+            if self._drag:
+                dx = (x - self._drag_start[0]) / self.zoom
+                dy = (y - self._drag_start[1]) / self.zoom
+                self.pan_x = self._pan_start[0] - dx
+                self.pan_y = self._pan_start[1] - dy
+                self._refresh()
+            else:
+                # Print original-image pixel coordinates to terminal
+                px, py = self._win_to_panel(x, y)
+                # Each of the 3 panels is pw/3 wide in the composite
+                col_w = self.pw / 3
+                col   = int(px // col_w)
+                names = ["ORIGINAL", "AI-SEES ", "OVERLAY "]
+                x_in  = int(px - col * col_w)
+                y_in  = int(py - 44)          # subtract title bar
+                if 0 <= col <= 2 and y_in >= 0:
+                    print(f"\r[{names[min(col,2)]}]  orig-pixel  x={x_in:5d}  y={y_in:5d}    ",
+                          end="", flush=True)
+
+        elif event == cv2.EVENT_LBUTTONUP:
+            self._drag = False
+
+    # ── main loop ─────────────────────────────────────────────────────────────
+
+    def run(self, save_path=None):
+        cv2.namedWindow(self.win, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(self.win, self._win_w, self._win_h)
+        cv2.setMouseCallback(self.win, self.mouse_callback)
+        self._refresh()
+
+        while True:
+            key = cv2.waitKey(30) & 0xFF
+
+            if key in (ord('q'), 27):       # Q / ESC → exit
+                break
+
+            elif key == ord('s'):           # S → save full panel
+                if save_path:
+                    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+                    cv2.imwrite(save_path, self.panel)
+                    print(f"\n[SAVED] {save_path}")
+
+            elif key == ord('r'):           # R → reset
+                self._reset()
+
+            elif key in (ord('+'), ord('=')):   # + → zoom in at centre
+                self._zoom_at(self.ZOOM_STEP,
+                              self._win_w // 2, self._win_h // 2)
+
+            elif key == ord('-'):               # - → zoom out at centre
+                self._zoom_at(1.0 / self.ZOOM_STEP,
+                              self._win_w // 2, self._win_h // 2)
+
+            elif key == 81 or key == 2424832:   # ← arrow
+                self.pan_x -= self.PAN_STEP / self.zoom
+                self._refresh()
+            elif key == 83 or key == 2555904:   # → arrow
+                self.pan_x += self.PAN_STEP / self.zoom
+                self._refresh()
+            elif key == 82 or key == 2490368:   # ↑ arrow
+                self.pan_y -= self.PAN_STEP / self.zoom
+                self._refresh()
+            elif key == 84 or key == 2621440:   # ↓ arrow
+                self.pan_y += self.PAN_STEP / self.zoom
+                self._refresh()
+
+        cv2.destroyAllWindows()
+        print()   # newline after coordinate printout
+
+
 def process_image(image_path, configs, save=False):
     # ── Load ──────────────────────────────────────────────────────────────────
     image = cv2.imread(image_path)
@@ -196,46 +409,36 @@ def process_image(image_path, configs, save=False):
 
     print(f"Product  : {product_key}")
 
-    main_masks    = config.get("mask", [])
-    normal_add    = config.get("threshold", {}).get("normal", {}).get("additional_mask", [])
-    bigdot_add    = config.get("threshold", {}).get("very_big_dot", {}).get("additional_mask", [])
+    main_masks = config.get("mask", [])
+    normal_add = config.get("threshold", {}).get("normal", {}).get("additional_mask", [])
+    bigdot_add = config.get("threshold", {}).get("very_big_dot", {}).get("additional_mask", [])
 
     print(f"Main mask zones      : {len(main_masks)}")
     print(f"Normal add_mask zones: {len(normal_add)}")
     print(f"BigDot add_mask zones: {len(bigdot_add)}")
+    print(f"\nHover mouse over window → pixel coordinates printed here.")
+    print(f"Use these coordinates to add new mask zones in config.yaml.\n")
 
     # ── Build three panels ────────────────────────────────────────────────────
-    masked_ai  = apply_main_mask(image, main_masks)
-    annotated  = draw_mask_overlay(image, config, product_key)
+    masked_ai = apply_main_mask(image, main_masks)
+    annotated = draw_mask_overlay(image, config, product_key)
     draw_legend(annotated, product_key, len(main_masks), len(normal_add), len(bigdot_add))
 
     panel = make_three_panel(image, masked_ai, annotated, product_key, config)
 
-    # ── Save if requested ─────────────────────────────────────────────────────
+    # ── Save full panel if requested ──────────────────────────────────────────
+    save_path = None
     if save:
         os.makedirs("viz_results", exist_ok=True)
-        out_path = os.path.join("viz_results", f"viz_{os.path.basename(image_path)}")
-        cv2.imwrite(out_path, panel)
-        print(f"[SAVED] {out_path}")
+        save_path = os.path.join("viz_results", f"viz_{os.path.basename(image_path)}")
+        cv2.imwrite(save_path, panel)
+        print(f"[SAVED] {save_path}")
 
-    # ── Show ──────────────────────────────────────────────────────────────────
-    win = "Mask Visualizer  |  Q=next/quit  S=save"
-    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-    ph, pw = panel.shape[:2]
-    cv2.resizeWindow(win, pw, ph)
-    cv2.imshow(win, panel)
-
-    while True:
-        key = cv2.waitKey(0) & 0xFF
-        if key == ord('q') or key == 27:
-            break
-        elif key == ord('s'):
-            os.makedirs("viz_results", exist_ok=True)
-            out_path = os.path.join("viz_results", f"viz_{os.path.basename(image_path)}")
-            cv2.imwrite(out_path, panel)
-            print(f"[SAVED] {out_path}")
-
-    cv2.destroyAllWindows()
+    # ── Launch interactive zoom/pan viewer ────────────────────────────────────
+    win_name = f"Mask Visualizer — {os.path.basename(image_path)}"
+    viewer   = ZoomPanViewer(panel, win_name, orig_image_w=w)
+    viewer.run(save_path=save_path or
+               os.path.join("viz_results", f"viz_{os.path.basename(image_path)}"))
 
 
 def main(args):
