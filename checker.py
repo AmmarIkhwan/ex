@@ -45,7 +45,7 @@ from glob import glob
 # ── colour palette (BGR) ─────────────────────────────────────────────────────
 COL_MAIN_MASK       = (0,   0,   0  )   # black fill  – main mask (AI never sees)
 COL_MAIN_BORDER     = (0,   255, 255)   # yellow border around main mask zones
-COL_NORMAL_ADD      = (0,   165, 255)   # orange – normal additional_mask
+COL_NORMAL_ADD      = (255, 200, 0  )   # teal/cyan – normal additional_mask
 COL_BIGDOT_ADD      = (255, 0,   255)   # magenta – very_big_dot additional_mask
 COL_LABEL_BG        = (30,  30,  30 )   # dark grey label background
 COL_WHITE           = (255, 255, 255)
@@ -137,51 +137,45 @@ def draw_mask_overlay(image, config, product_key):
 def draw_overlay_hud(view, product_key, main_count, normal_add_count, bigdot_add_count,
                      zoom, coord_text=""):
     """
-    Draw legend + zoom level + coordinate info DIRECTLY onto the window view
-    (after zoom/crop). Text is always crisp regardless of zoom level.
+    Draw a crisp HUD bar at the BOTTOM of the window view — never overlaps images.
+    Always redrawn after zoom/crop so text is pixel-perfect at any zoom level.
     """
-    font    = cv2.FONT_HERSHEY_SIMPLEX
-    fs      = 0.52
-    th      = 1
-    line_h  = 22
-    pad     = 8
+    font   = cv2.FONT_HERSHEY_SIMPLEX
+    fs     = 0.50
+    th     = 1
+    pad    = 10
+    line_h = 22
+    vw     = view.shape[1]
 
-    legend_lines = [
-        (f"  Product : {product_key}",                          COL_GREEN),
-        (f"  Main mask zones      : {main_count}",              (0, 255, 255)),
-        (f"  Normal additional    : {normal_add_count}",        (0, 165, 255)),
-        (f"  BigDot additional    : {bigdot_add_count}",        (255, 0, 255)),
-        ("",                                                     COL_WHITE),
-        ("  [YELLOW] AI blind zone (main mask)",                (0, 255, 255)),
-        ("  [ORANGE] Normal detections ignored here",           (0, 165, 255)),
-        ("  [MAGENTA] BigDot detections ignored here",          (255, 0, 255)),
-        ("",                                                     COL_WHITE),
-        (f"  Zoom: {zoom:.2f}x",                                COL_WHITE),
-        ("  Scroll=zoom  Drag=pan  R=reset  S=save  Q=quit",   (180, 180, 180)),
+    # Draw solid dark background (bar is already black from np.zeros)
+    cv2.line(view, (0, 0), (vw, 0), (60, 60, 60), 1)  # top border line
+
+    # Colour-coded keyword highlights drawn as separate segments on line 0
+    y0 = pad + 14
+
+    segments_line0 = [
+        (f"Product: {product_key}   |   Main mask: {main_count} zones ", COL_WHITE),
+        ("[YELLOW]", (0, 255, 255)),
+        (f"   |   Normal additional: {normal_add_count} zones ", COL_WHITE),
+        ("[CYAN]", (255, 200, 0)),
+        (f"   |   BigDot additional: {bigdot_add_count} zones ", COL_WHITE),
+        ("[MAGENTA]", (255, 0, 255)),
+        (f"   |   Zoom: {zoom:.2f}x", COL_WHITE),
     ]
+    x_cursor = pad
+    for text, col in segments_line0:
+        cv2.putText(view, text, (x_cursor, y0), font, fs, col, th, cv2.LINE_AA)
+        tw, _ = cv2.getTextSize(text, font, fs, th)[0]
+        x_cursor += tw
 
+    # Line 1: controls + coordinate
+    y1 = pad + line_h + 14
+    ctrl_text = "Scroll=zoom   Drag=pan   R=reset   S=save   Q=quit"
+    cv2.putText(view, ctrl_text, (pad, y1), font, fs, (140, 140, 140), th, cv2.LINE_AA)
     if coord_text:
-        legend_lines.append(("", COL_WHITE))
-        legend_lines.append((f"  {coord_text}", (100, 255, 100)))
-
-    # Measure box width
-    max_w = max(cv2.getTextSize(l, font, fs, th)[0][0]
-                for l, _ in legend_lines if l) + pad * 2
-    box_h = len(legend_lines) * line_h + pad * 2
-
-    # Semi-transparent background
-    x0, y0 = 6, 6
-    overlay = view.copy()
-    cv2.rectangle(overlay, (x0, y0), (x0 + max_w, y0 + box_h), (10, 10, 10), -1)
-    cv2.addWeighted(overlay, 0.75, view, 0.25, 0, view)
-    cv2.rectangle(view, (x0, y0), (x0 + max_w, y0 + box_h), (60, 60, 60), 1)
-
-    # Draw each line
-    for i, (line, col) in enumerate(legend_lines):
-        if line:
-            cv2.putText(view, line,
-                        (x0 + pad, y0 + pad + line_h * i + 14),
-                        font, fs, col, th, cv2.LINE_AA)
+        ctrl_w = cv2.getTextSize(ctrl_text, font, fs, th)[0][0]
+        cv2.putText(view, f"   |   {coord_text}", (pad + ctrl_w, y1),
+                    font, fs, (100, 255, 100), th, cv2.LINE_AA)
 
 
 def make_three_panel(original, masked_ai, annotated, product_key, config,
@@ -244,9 +238,11 @@ class ZoomPanViewer:
         self.bigdot_add_count = bigdot_add_count
         self._coord_text      = ""
 
-        self._win_w = min(1800, self.pw)
-        self._win_h = int(self.ph * self._win_w / self.pw)
-        self.zoom   = self._win_w / self.pw
+        self._win_w  = min(1800, self.pw)
+        self._img_h  = int(self.ph * self._win_w / self.pw)  # image area height
+        self._bar_h  = 56                                      # HUD bar height
+        self._win_h  = self._img_h + self._bar_h              # total window height
+        self.zoom    = self._win_w / self.pw
 
         self.pan_x  = 0.0
         self.pan_y  = 0.0
@@ -280,12 +276,10 @@ class ZoomPanViewer:
     # ── render ────────────────────────────────────────────────────────────────
 
     def _get_view(self):
-        """Crop + resize the panel to produce the current window view."""
-        # Visible region in panel pixels
+        """Crop + resize the panel to produce the current image view (no HUD bar)."""
         vis_w = self._win_w / self.zoom
-        vis_h = self._win_h / self.zoom
+        vis_h = self._img_h / self.zoom
 
-        # Clamp pan so we never go out of bounds
         self.pan_x = max(0.0, min(self.pan_x, self.pw - vis_w))
         self.pan_y = max(0.0, min(self.pan_y, self.ph - vis_h))
 
@@ -295,21 +289,27 @@ class ZoomPanViewer:
         y2 = min(self.ph, int(self.pan_y + vis_h) + 1)
 
         crop = self.panel[y1:y2, x1:x2]
-        view = cv2.resize(crop, (self._win_w, self._win_h),
+        view = cv2.resize(crop, (self._win_w, self._img_h),
                           interpolation=cv2.INTER_LINEAR)
         return view
 
     def _refresh(self):
-        view = self._get_view()
-        # Draw legend + HUD directly on the view — always pixel-perfect
-        draw_overlay_hud(view,
+        # Image area (zoomable/pannable)
+        img_view = self._get_view()
+
+        # HUD bar (fixed height, always crisp)
+        bar = np.zeros((self._bar_h, self._win_w, 3), dtype=np.uint8)
+        draw_overlay_hud(bar,
                          self.product_key,
                          self.main_count,
                          self.normal_add_count,
                          self.bigdot_add_count,
                          self.zoom,
                          self._coord_text)
-        cv2.imshow(self.win, view)
+
+        # Stack: image on top, HUD bar on bottom
+        combined = np.vstack([img_view, bar])
+        cv2.imshow(self.win, combined)
 
     # ── zoom helper ───────────────────────────────────────────────────────────
 
