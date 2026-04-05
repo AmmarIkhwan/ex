@@ -134,29 +134,54 @@ def draw_mask_overlay(image, config, product_key):
     return overlay
 
 
-def draw_legend(img, product_key, main_count, normal_add_count, bigdot_add_count):
-    """Draw a legend panel on the top-left of the image."""
-    lines = [
-        f"Product : {product_key}",
-        f"Main masks      : {main_count}  zones  [YELLOW border]",
-        f"Normal add mask : {normal_add_count}  zones  [ORANGE fill]",
-        f"BigDot add mask : {bigdot_add_count}  zones  [MAGENTA fill]",
-        "",
-        "AI is BLIND inside yellow borders.",
-        "Detections inside orange/magenta are IGNORED.",
+def draw_overlay_hud(view, product_key, main_count, normal_add_count, bigdot_add_count,
+                     zoom, coord_text=""):
+    """
+    Draw legend + zoom level + coordinate info DIRECTLY onto the window view
+    (after zoom/crop). Text is always crisp regardless of zoom level.
+    """
+    font    = cv2.FONT_HERSHEY_SIMPLEX
+    fs      = 0.52
+    th      = 1
+    line_h  = 22
+    pad     = 8
+
+    legend_lines = [
+        (f"  Product : {product_key}",                          COL_GREEN),
+        (f"  Main mask zones      : {main_count}",              (0, 255, 255)),
+        (f"  Normal additional    : {normal_add_count}",        (0, 165, 255)),
+        (f"  BigDot additional    : {bigdot_add_count}",        (255, 0, 255)),
+        ("",                                                     COL_WHITE),
+        ("  [YELLOW] AI blind zone (main mask)",                (0, 255, 255)),
+        ("  [ORANGE] Normal detections ignored here",           (0, 165, 255)),
+        ("  [MAGENTA] BigDot detections ignored here",          (255, 0, 255)),
+        ("",                                                     COL_WHITE),
+        (f"  Zoom: {zoom:.2f}x",                                COL_WHITE),
+        ("  Scroll=zoom  Drag=pan  R=reset  S=save  Q=quit",   (180, 180, 180)),
     ]
-    x, y = 10, 10
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    fs, th = 0.55, 1
-    line_h = 24
-    max_w = max(cv2.getTextSize(l, font, fs, th)[0][0] for l in lines if l) + 20
-    box_h = len(lines) * line_h + 14
-    cv2.rectangle(img, (x, y), (x + max_w, y + box_h), (20, 20, 20), -1)
-    cv2.rectangle(img, (x, y), (x + max_w, y + box_h), COL_GREEN, 1)
-    for i, line in enumerate(lines):
-        col = COL_GREEN if i == 0 else COL_WHITE
-        cv2.putText(img, line, (x + 6, y + 20 + i * line_h),
-                    font, fs, col, th, cv2.LINE_AA)
+
+    if coord_text:
+        legend_lines.append(("", COL_WHITE))
+        legend_lines.append((f"  {coord_text}", (100, 255, 100)))
+
+    # Measure box width
+    max_w = max(cv2.getTextSize(l, font, fs, th)[0][0]
+                for l, _ in legend_lines if l) + pad * 2
+    box_h = len(legend_lines) * line_h + pad * 2
+
+    # Semi-transparent background
+    x0, y0 = 6, 6
+    overlay = view.copy()
+    cv2.rectangle(overlay, (x0, y0), (x0 + max_w, y0 + box_h), (10, 10, 10), -1)
+    cv2.addWeighted(overlay, 0.75, view, 0.25, 0, view)
+    cv2.rectangle(view, (x0, y0), (x0 + max_w, y0 + box_h), (60, 60, 60), 1)
+
+    # Draw each line
+    for i, (line, col) in enumerate(legend_lines):
+        if line:
+            cv2.putText(view, line,
+                        (x0 + pad, y0 + pad + line_h * i + 14),
+                        font, fs, col, th, cv2.LINE_AA)
 
 
 def make_three_panel(original, masked_ai, annotated, product_key, config,
@@ -197,40 +222,40 @@ class ZoomPanViewer:
     Zoom  : scroll wheel  or  +/-  keys
     Pan   : left-click drag  or  arrow keys
     Reset : R key
-    Coords: hover mouse → prints original-image pixel coordinates to terminal
+    Coords: hover mouse → live coordinate shown in the HUD overlay (always crisp)
     """
 
-    ZOOM_STEP   = 1.15    # multiply zoom by this on each scroll tick
+    ZOOM_STEP   = 1.15
     ZOOM_MIN    = 0.05
     ZOOM_MAX    = 40.0
-    PAN_STEP    = 40      # pixels to pan per arrow-key press
+    PAN_STEP    = 40
 
-    def __init__(self, panel, win_name, orig_image_w):
-        self.panel       = panel          # full three-panel image (numpy array)
+    def __init__(self, panel, win_name, orig_image_w,
+                 product_key="", main_count=0, normal_add_count=0, bigdot_add_count=0):
+        self.panel       = panel
         self.win         = win_name
         self.ph, self.pw = panel.shape[:2]
-
-        # orig_image_w: width of ONE panel before the 3-panel composite was built.
-        # Used to map mouse X → which panel and the pixel coord within it.
         self.orig_image_w = orig_image_w
 
-        # Fit-to-window scale at start
+        # Legend data (drawn fresh every frame — never pixelates)
+        self.product_key      = product_key
+        self.main_count       = main_count
+        self.normal_add_count = normal_add_count
+        self.bigdot_add_count = bigdot_add_count
+        self._coord_text      = ""
+
         self._win_w = min(1800, self.pw)
         self._win_h = int(self.ph * self._win_w / self.pw)
-        self.zoom   = self._win_w / self.pw   # initial scale = fit screen
+        self.zoom   = self._win_w / self.pw
 
-        # Pan offset: top-left corner of the visible region in panel-pixel space
         self.pan_x  = 0.0
         self.pan_y  = 0.0
 
-        # Mouse state for drag-pan
         self._drag       = False
         self._drag_start = (0, 0)
         self._pan_start  = (0.0, 0.0)
-
-        # Last known mouse position (window pixels)
-        self._mouse_x = 0
-        self._mouse_y = 0
+        self._mouse_x    = 0
+        self._mouse_y    = 0
 
     # ── coordinate helpers ────────────────────────────────────────────────────
 
@@ -274,15 +299,16 @@ class ZoomPanViewer:
                           interpolation=cv2.INTER_LINEAR)
         return view
 
-    def _draw_hud(self, view):
-        """Overlay zoom level and coordinate hint on the view."""
-        txt = f"Zoom: {self.zoom:.2f}x  |  Scroll=zoom  Drag=pan  R=reset  S=save  Q=quit"
-        cv2.putText(view, txt, (8, self._win_h - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (200, 200, 200), 1, cv2.LINE_AA)
-
     def _refresh(self):
         view = self._get_view()
-        self._draw_hud(view)
+        # Draw legend + HUD directly on the view — always pixel-perfect
+        draw_overlay_hud(view,
+                         self.product_key,
+                         self.main_count,
+                         self.normal_add_count,
+                         self.bigdot_add_count,
+                         self.zoom,
+                         self._coord_text)
         cv2.imshow(self.win, view)
 
     # ── zoom helper ───────────────────────────────────────────────────────────
@@ -325,17 +351,21 @@ class ZoomPanViewer:
                 self.pan_y = self._pan_start[1] - dy
                 self._refresh()
             else:
-                # Print original-image pixel coordinates to terminal
+                # Compute original-image pixel under cursor → show in HUD
                 px, py = self._win_to_panel(x, y)
-                # Each of the 3 panels is pw/3 wide in the composite
-                col_w = self.pw / 3
-                col   = int(px // col_w)
-                names = ["ORIGINAL", "AI-SEES ", "OVERLAY "]
-                x_in  = int(px - col * col_w)
-                y_in  = int(py - 44)          # subtract title bar
+                col_w  = self.pw / 3
+                col    = int(px // col_w)
+                names  = ["ORIGINAL", "AI-SEES", "OVERLAY"]
+                x_in   = int(px - col * col_w)
+                y_in   = int(py - 44)   # subtract title bar height
                 if 0 <= col <= 2 and y_in >= 0:
-                    print(f"\r[{names[min(col,2)]}]  orig-pixel  x={x_in:5d}  y={y_in:5d}    ",
-                          end="", flush=True)
+                    self._coord_text = (
+                        f"[{names[min(col,2)]}]  x={x_in}  y={y_in}"
+                        f"  ← copy to config.yaml mask"
+                    )
+                    # Also print to terminal for easy copy-paste
+                    print(f"\r  {self._coord_text}    ", end="", flush=True)
+                self._refresh()
 
         elif event == cv2.EVENT_LBUTTONUP:
             self._drag = False
@@ -422,7 +452,7 @@ def process_image(image_path, configs, save=False):
     # ── Build three panels ────────────────────────────────────────────────────
     masked_ai = apply_main_mask(image, main_masks)
     annotated = draw_mask_overlay(image, config, product_key)
-    draw_legend(annotated, product_key, len(main_masks), len(normal_add), len(bigdot_add))
+    # NOTE: legend is no longer baked into the panel — drawn live on the view instead
 
     panel = make_three_panel(image, masked_ai, annotated, product_key, config)
 
@@ -436,7 +466,13 @@ def process_image(image_path, configs, save=False):
 
     # ── Launch interactive zoom/pan viewer ────────────────────────────────────
     win_name = f"Mask Visualizer — {os.path.basename(image_path)}"
-    viewer   = ZoomPanViewer(panel, win_name, orig_image_w=w)
+    viewer   = ZoomPanViewer(
+        panel, win_name, orig_image_w=w,
+        product_key=product_key,
+        main_count=len(main_masks),
+        normal_add_count=len(normal_add),
+        bigdot_add_count=len(bigdot_add),
+    )
     viewer.run(save_path=save_path or
                os.path.join("viz_results", f"viz_{os.path.basename(image_path)}"))
 
